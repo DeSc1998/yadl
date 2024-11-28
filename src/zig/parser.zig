@@ -11,13 +11,23 @@ pub const Error = Lexer.Error || error{
     NumberParsingFailure,
 };
 
+const StatementKind = enum {
+    root_statement,
+    code_block_statement,
+};
+
+const IfKind = enum {
+    initial_branch,
+    follow_up_branch,
+};
+
 tokens: RingBuffer = .{},
 lexer: Lexer,
 allocator: std.mem.Allocator,
 last_expected: ?Kind = null,
 last_expected_chars: ?[]const u8 = null,
 
-var parser_diagnostic: bool = false;
+var parser_diagnostic: bool = true;
 
 const Kind = Lexer.TokenKind;
 const Token = Lexer.Token;
@@ -554,12 +564,13 @@ fn parseCondition(self: *Self) Error!*expr.Expression {
 }
 
 fn parseCodeblock(self: *Self) Error![]stmt.Statement {
+    // @breakpoint();
     _ = try self.expect(.OpenParen, "{");
     _ = try self.expect(.Newline, null);
     if (Self.parser_diagnostic) {
         std.debug.print("DEBUG: read initial newline in code block\n", .{});
     }
-    const code = try self.parseStatements(true);
+    const code = try self.parseStatements(.code_block_statement);
     _ = try self.expect(.CloseParen, "}");
     return code;
 }
@@ -574,16 +585,30 @@ fn parseBranch(self: *Self) Error!stmt.Branch {
     };
 }
 
-fn parseIfStatement(self: *Self, is_initial_branch: bool) Error!stmt.Statement {
-    if (is_initial_branch) {
-        _ = self.expect(.Keyword, "if") catch unreachable;
+fn parseIfStatement(self: *Self, kind: IfKind) Error!stmt.Statement {
+    if (Self.parser_diagnostic) {
+        std.debug.print("INFO: parsing of if-statement\n", .{});
     }
 
-    const branch = try self.parseBranch();
+    if (kind == .initial_branch) {
+        _ = try self.expect(.Keyword, "if");
+    }
+
+    const branch = self.parseBranch() catch |err| {
+        if (err == Error.EndOfFile) {
+            self.last_expected = .CloseParen;
+            self.last_expected_chars = "}";
+            return Error.UnexpectedToken;
+        } else return err;
+    };
+    errdefer expr.free(self.allocator, branch.condition);
+    errdefer self.allocator.free(branch.body);
+    errdefer for (branch.body) |st| stmt.free(self.allocator, st);
 
     _ = self.expect(.Newline, null) catch {};
+
     if (self.expect(.Keyword, "elif")) |_| {
-        const tmp = try self.parseIfStatement(false);
+        const tmp = try self.parseIfStatement(.follow_up_branch);
         const stmts = try self.allocator.alloc(stmt.Statement, 1);
         stmts[0] = tmp;
         return .{ .if_statement = .{
@@ -591,10 +616,16 @@ fn parseIfStatement(self: *Self, is_initial_branch: bool) Error!stmt.Statement {
             .elseBranch = stmts,
         } };
     } else |e| {
-        if (e != Error.UnexpectedToken and e != Error.EndOfFile) return e;
+        if (e == Error.EndOfFile)
+            return .{ .if_statement = .{
+                .ifBranch = branch,
+                .elseBranch = null,
+            } };
+
+        if (e != Error.UnexpectedToken) return e;
 
         _ = self.expect(.Keyword, "else") catch |err| {
-            if (err != Error.UnexpectedToken and err != Error.EndOfFile)
+            if (err != Error.UnexpectedToken)
                 return err;
 
             return .{ .if_statement = .{
@@ -603,7 +634,13 @@ fn parseIfStatement(self: *Self, is_initial_branch: bool) Error!stmt.Statement {
             } };
         };
 
-        const elseCode = try self.parseCodeblock();
+        const elseCode = self.parseCodeblock() catch |err| {
+            if (err == Error.EndOfFile) {
+                self.last_expected = .CloseParen;
+                self.last_expected_chars = "}";
+                return Error.UnexpectedToken;
+            } else return err;
+        };
 
         return .{ .if_statement = .{
             .ifBranch = branch,
@@ -708,12 +745,15 @@ fn parseStatement(self: *Self) Error!stmt.Statement {
         }
 
         const st = try switch (token.kind) {
-            .Keyword => if (token.chars[0] == 'r')
-                self.parseReturn()
-            else if (token.chars[0] == 'i')
-                self.parseIfStatement(true)
-            else
-                self.parseWhileloop(),
+            .Keyword => b: {
+                if (token.chars[0] == 'r') {
+                    break :b self.parseReturn();
+                } else if (token.chars[0] == 'i') {
+                    break :b self.parseIfStatement(.initial_branch);
+                } else if (token.chars[0] == 'w') {
+                    break :b self.parseWhileloop();
+                } else break :b Error.UnexpectedToken;
+            },
             .Identifier => if (self.nextToken()) |t| (if (t.kind == .OpenParen and t.chars[0] == '(')
                 self.parseFunctionCall()
             else if (t.kind == .OpenParen and t.chars[0] == '[')
@@ -749,7 +789,7 @@ fn parseStatement(self: *Self) Error!stmt.Statement {
     unreachable;
 }
 
-fn parseStatements(self: *Self, should_ignore_paran: bool) Error![]stmt.Statement {
+fn parseStatements(self: *Self, statement_kind: StatementKind) Error![]stmt.Statement {
     var stmts = std.ArrayList(stmt.Statement).init(self.allocator);
     while (self.parseStatement()) |statement| {
         try stmts.append(statement);
@@ -758,38 +798,43 @@ fn parseStatements(self: *Self, should_ignore_paran: bool) Error![]stmt.Statemen
             std.debug.print("INFO: error: {}\n", .{err});
         }
 
-        if (err != Error.EndOfFile and err != Error.UnexpectedToken)
-            return err;
+        switch (err) {
+            Error.EndOfFile => {
+                if (statement_kind == .root_statement) {
+                    return stmts.toOwnedSlice();
+                } else return err;
+            },
+            Error.UnexpectedToken => {
+                const token = self.currentToken() orelse unreachable;
+                if (std.mem.eql(u8, token.chars, "}") and statement_kind == .code_block_statement)
+                    return stmts.toOwnedSlice();
 
-        if (err == Error.UnexpectedToken and !should_ignore_paran) {
-            const token = self.currentToken() orelse unreachable;
-            if (std.mem.eql(u8, token.chars, "}") and should_ignore_paran)
-                return stmts.toOwnedSlice();
-
-            if (self.last_expected) |kind| {
-                try unexpectedToken(
-                    self.*,
-                    token,
-                    &[_]Lexer.TokenKind{kind},
-                    self.last_expected_chars,
-                );
-            } else {
-                try unexpectedToken(
-                    self.*,
-                    token,
-                    &[_]Lexer.TokenKind{ .Identifier, .Keyword },
-                    null,
-                );
-            }
+                if (self.last_expected) |kind| {
+                    try unexpectedToken(
+                        self.*,
+                        token,
+                        &[_]Lexer.TokenKind{kind},
+                        self.last_expected_chars,
+                    );
+                } else {
+                    try unexpectedToken(
+                        self.*,
+                        token,
+                        &[_]Lexer.TokenKind{ .Identifier, .Keyword },
+                        null,
+                    );
+                }
+            },
+            else => return err,
         }
     }
-    return stmts.toOwnedSlice();
+    unreachable;
 }
 
-/// Returns an owned slice of Statements which must be
+/// Returns an owned slice of Statements which each must be
 /// freed with `fn free(std.mem.Allocator, Statement)` in statements.zig
 pub fn parse(self: *Self) Error![]stmt.Statement {
-    return self.parseStatements(false);
+    return self.parseStatements(.root_statement);
 }
 
 test "simple assignment" {
@@ -797,11 +842,6 @@ test "simple assignment" {
         \\aoeu = aoeu
         \\
     ;
-    var ident = .{ .identifier = .{ .name = "aoeu" } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &ident,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -813,9 +853,9 @@ test "simple assignment" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .identifier);
-    try std.testing.expectEqualStrings(expected.assignment.value.identifier.name, result_stmt.assignment.value.identifier.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.value.identifier.name);
 }
 
 test "function" {
@@ -825,18 +865,6 @@ test "function" {
         \\}
         \\
     ;
-    var ident = .{ .identifier = .{ .name = "x" } };
-    const ret_value = .{ .value = &ident };
-    var fun = .{ .function = .{
-        .args = &[_]expr.Identifier{.{ .name = "x" }},
-        .body = &[_]stmt.Statement{
-            .{ .@"return" = ret_value },
-        },
-    } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &fun,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -848,11 +876,11 @@ test "function" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .function);
     const function = result_stmt.assignment.value.function;
-    try std.testing.expectEqual(expected.assignment.value.function.args.len, function.args.len);
-    try std.testing.expectEqual(expected.assignment.value.function.body.len, function.body.len);
+    try std.testing.expectEqual(1, function.args.len);
+    try std.testing.expectEqual(1, function.body.len);
 }
 
 test "function - no args" {
@@ -862,18 +890,6 @@ test "function - no args" {
         \\}
         \\
     ;
-    var ident = .{ .identifier = .{ .name = "x" } };
-    const ret_value = .{ .value = &ident };
-    var fun = .{ .function = .{
-        .args = &[_]expr.Identifier{},
-        .body = &[_]stmt.Statement{
-            .{ .@"return" = ret_value },
-        },
-    } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &fun,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -887,17 +903,12 @@ test "function - no args" {
     try std.testing.expect(result_stmt == .assignment);
     try std.testing.expect(result_stmt.assignment.value.* == .function);
     const function = result_stmt.assignment.value.function;
-    try std.testing.expectEqual(expected.assignment.value.function.args.len, function.args.len);
-    try std.testing.expectEqual(expected.assignment.value.function.body.len, function.body.len);
+    try std.testing.expectEqual(0, function.args.len);
+    try std.testing.expectEqual(1, function.body.len);
 }
 
 test "simple assignment - no newline" {
     const input = "aoeu = aoeu";
-    var ident = .{ .identifier = .{ .name = "aoeu" } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &ident,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -909,21 +920,13 @@ test "simple assignment - no newline" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .identifier);
-    try std.testing.expectEqualStrings(expected.assignment.value.identifier.name, result_stmt.assignment.value.identifier.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.value.identifier.name);
 }
 
 test "function call No args" {
     const input = "aoeu = aoeu()\n";
-    var funCall: expr.Expression = .{ .functioncall = .{
-        .func = &.{ .identifier = .{ .name = "aoeu" } },
-        .args = &[_]expr.Expression{},
-    } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &funCall,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -935,27 +938,19 @@ test "function call No args" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .functioncall);
     const result_fc = result_stmt.assignment.value.functioncall;
-    try std.testing.expectEqualStrings(funCall.functioncall.func.identifier.name, result_fc.func.identifier.name);
-    try std.testing.expectEqualSlices(expr.Expression, funCall.functioncall.args, result_fc.args);
+    try std.testing.expectEqualStrings("aoeu", result_fc.func.identifier.name);
+    try std.testing.expectEqual(0, result_fc.args.len);
 }
 
 test "function call" {
     const input = "aoeu = aoeu(1, 2)";
-    var args = [2]expr.Expression{
+    const args = [2]expr.Expression{
         .{ .number = .{ .integer = 1 } },
         .{ .number = .{ .integer = 2 } },
     };
-    var funCall: expr.Expression = .{ .functioncall = .{
-        .func = &.{ .identifier = .{ .name = "aoeu" } },
-        .args = &args,
-    } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &funCall,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -967,11 +962,11 @@ test "function call" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .functioncall);
     const result_fc = result_stmt.assignment.value.functioncall;
-    try std.testing.expectEqualStrings(funCall.functioncall.func.identifier.name, result_fc.func.identifier.name);
-    try std.testing.expectEqualSlices(expr.Expression, funCall.functioncall.args, result_fc.args);
+    try std.testing.expectEqualStrings("aoeu", result_fc.func.identifier.name);
+    try std.testing.expectEqualSlices(expr.Expression, args[0..], result_fc.args);
 }
 
 test "dictionary" {
@@ -979,11 +974,6 @@ test "dictionary" {
     var exp: expr.Expression = .{ .number = .{ .integer = 1 } };
     var entries: [1]expr.DictionaryEntry = undefined;
     entries[0] = .{ .key = &exp, .value = &exp };
-    var dict: expr.Expression = .{ .dictionary = .{ .entries = &entries } };
-    const expected_: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &dict,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -995,11 +985,11 @@ test "dictionary" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected_.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .dictionary);
     const result_arr = result_stmt.assignment.value.dictionary;
-    try std.testing.expectEqual(dict.dictionary.entries.len, result_arr.entries.len);
-    for (dict.dictionary.entries, result_arr.entries) |expected, actual| {
+    try std.testing.expectEqual(entries.len, result_arr.entries.len);
+    for (entries, result_arr.entries) |expected, actual| {
         try std.testing.expectEqual(expected.key.*, actual.key.*);
         try std.testing.expectEqual(expected.value.*, actual.value.*);
     }
@@ -1014,11 +1004,6 @@ test "dictionary 3 entries" {
     entries[0] = .{ .key = &exp1, .value = &exp1 };
     entries[1] = .{ .key = &exp2, .value = &exp2 };
     entries[2] = .{ .key = &exp3, .value = &exp3 };
-    var dict: expr.Expression = .{ .dictionary = .{ .entries = &entries } };
-    const expected_: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &dict,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1030,11 +1015,11 @@ test "dictionary 3 entries" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected_.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .dictionary);
     const result_arr = result_stmt.assignment.value.dictionary;
-    try std.testing.expectEqual(dict.dictionary.entries.len, result_arr.entries.len);
-    for (dict.dictionary.entries, result_arr.entries) |expected, actual| {
+    try std.testing.expectEqual(entries.len, result_arr.entries.len);
+    for (entries, result_arr.entries) |expected, actual| {
         try std.testing.expectEqual(expected.key.*, actual.key.*);
         try std.testing.expectEqual(expected.value.*, actual.value.*);
     }
@@ -1042,12 +1027,6 @@ test "dictionary 3 entries" {
 
 test "dictionary empty" {
     const input = "aoeu = { }";
-    const entries: []expr.DictionaryEntry = &[_]expr.DictionaryEntry{};
-    var dict: expr.Expression = .{ .dictionary = .{ .entries = entries } };
-    const expected_: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &dict,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1059,10 +1038,10 @@ test "dictionary empty" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected_.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .dictionary);
     const result_arr = result_stmt.assignment.value.dictionary;
-    try std.testing.expectEqual(dict.dictionary.entries.len, result_arr.entries.len);
+    try std.testing.expectEqual(0, result_arr.entries.len);
 }
 
 test "assign after array" {
@@ -1081,7 +1060,6 @@ test "assign after array" {
     elements[2] = tmp;
     tmp.number.integer = 4;
     elements[3] = tmp;
-    const arr: expr.Expression = .{ .array = .{ .elements = &elements } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1099,8 +1077,8 @@ test "assign after array" {
     try std.testing.expect(result_stmt_2.assignment.value.* == .array);
     const result_arr_1 = result_stmt_1.assignment.value.array;
     const result_arr_2 = result_stmt_2.assignment.value.array;
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_1.elements);
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_2.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_1.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_2.elements);
 }
 
 test "comment" {
@@ -1119,7 +1097,6 @@ test "comment" {
     elements[2] = tmp;
     tmp.number.integer = 4;
     elements[3] = tmp;
-    const arr: expr.Expression = .{ .array = .{ .elements = &elements } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1137,8 +1114,8 @@ test "comment" {
     try std.testing.expect(result_stmt_2.assignment.value.* == .array);
     const result_arr_1 = result_stmt_1.assignment.value.array;
     const result_arr_2 = result_stmt_2.assignment.value.array;
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_1.elements);
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_2.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_1.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_2.elements);
 }
 
 test "newline + assign after array" {
@@ -1153,7 +1130,6 @@ test "newline + assign after array" {
     elements[0] = tmp;
     tmp.number.integer = 2;
     elements[1] = tmp;
-    const arr: expr.Expression = .{ .array = .{ .elements = &elements } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1171,17 +1147,12 @@ test "newline + assign after array" {
     try std.testing.expect(result_stmt_2.assignment.value.* == .array);
     const result_arr_1 = result_stmt_1.assignment.value.array;
     const result_arr_2 = result_stmt_2.assignment.value.array;
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_1.elements);
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr_2.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_1.elements);
+    try std.testing.expectEqualSlices(expr.Expression, elements[0..], result_arr_2.elements);
 }
 
 test "empty array" {
     const input = "aoeu = [ ] \n";
-    var arr: expr.Expression = .{ .array = .{ .elements = &[_]expr.Expression{} } };
-    const expected: stmt.Statement = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &arr,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1193,10 +1164,10 @@ test "empty array" {
     try std.testing.expectEqual(1, result.len);
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .assignment);
-    try std.testing.expectEqualStrings(expected.assignment.varName.name, result_stmt.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_stmt.assignment.varName.name);
     try std.testing.expect(result_stmt.assignment.value.* == .array);
     const result_arr = result_stmt.assignment.value.array;
-    try std.testing.expectEqualSlices(expr.Expression, arr.array.elements, result_arr.elements);
+    try std.testing.expectEqual(0, result_arr.elements.len);
 }
 
 test "simple if statement" {
@@ -1204,24 +1175,7 @@ test "simple if statement" {
         \\if (true) {
         \\    aoeu = aoeu
         \\}
-        \\
     ;
-    var cond = .{ .boolean = .{ .value = true } };
-    var ident = .{ .identifier = .{ .name = "aoeu" } };
-    const ass = .{ .assignment = .{
-        .varName = .{ .name = "aoeu" },
-        .value = &ident,
-    } };
-    const branch: stmt.Branch = .{
-        .condition = &cond,
-        .body = &[_]stmt.Statement{
-            ass,
-        },
-    };
-    const expected: stmt.Statement = .{ .if_statement = .{
-        .ifBranch = branch,
-        .elseBranch = null,
-    } };
 
     var parser = Self.init(input, std.testing.allocator);
     const result = parser.parse() catch unreachable;
@@ -1234,16 +1188,57 @@ test "simple if statement" {
     const result_stmt = result[0];
     try std.testing.expect(result_stmt == .if_statement);
 
-    const expected_branch = expected.if_statement.ifBranch;
     const result_branch = result_stmt.if_statement.ifBranch;
 
     try std.testing.expect(result_branch.condition.* == .boolean);
-    try std.testing.expectEqual(expected_branch.condition.boolean.value, result_branch.condition.boolean.value);
+    try std.testing.expect(result_branch.condition.boolean.value);
 
-    const expected_body_statement = expected_branch.body[0];
     const result_body_statement = result_branch.body[0];
 
     try std.testing.expect(result_body_statement == .assignment);
-    try std.testing.expectEqualStrings(expected_body_statement.assignment.value.identifier.name, result_body_statement.assignment.value.identifier.name);
-    try std.testing.expectEqualStrings(expected_body_statement.assignment.varName.name, result_body_statement.assignment.varName.name);
+    try std.testing.expectEqualStrings("aoeu", result_body_statement.assignment.value.identifier.name);
+    try std.testing.expectEqualStrings("aoeu", result_body_statement.assignment.varName.name);
+}
+
+test "simple if else statement" {
+    const input =
+        \\if (true) {
+        \\    aoeu = aoeu
+        \\}
+        \\else {
+        \\ test()
+        \\}
+    ;
+
+    var parser = Self.init(input, std.testing.allocator);
+    const result = parser.parse() catch unreachable;
+    defer std.testing.allocator.free(result);
+    defer for (result) |st| {
+        stmt.free(std.testing.allocator, st);
+    };
+
+    try std.testing.expectEqual(1, result.len);
+    const result_stmt = result[0];
+    try std.testing.expect(result_stmt == .if_statement);
+
+    const result_branch = result_stmt.if_statement.ifBranch;
+
+    try std.testing.expect(result_branch.condition.* == .boolean);
+    try std.testing.expect(result_branch.condition.boolean.value);
+
+    try std.testing.expectEqual(1, result_branch.body.len);
+    const result_body_statement = result_branch.body[0];
+
+    try std.testing.expect(result_body_statement == .assignment);
+    try std.testing.expectEqualStrings("aoeu", result_body_statement.assignment.value.identifier.name);
+    try std.testing.expectEqualStrings("aoeu", result_body_statement.assignment.varName.name);
+
+    const result_else = result_stmt.if_statement.elseBranch orelse unreachable;
+    try std.testing.expectEqual(1, result_else.len);
+    const result_else_statement = result_else[0];
+
+    try std.testing.expect(result_else_statement == .functioncall);
+    try std.testing.expect(.identifier == result_else_statement.functioncall.func.*);
+    try std.testing.expectEqualStrings("test", result_else_statement.functioncall.func.identifier.name);
+    try std.testing.expectEqual(0, result_else_statement.functioncall.args.len);
 }

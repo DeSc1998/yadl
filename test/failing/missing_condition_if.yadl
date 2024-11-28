@@ -1,0 +1,6 @@
+// RUN: DEFAULT
+if () {
+ print(1 + 1)
+}
+
+

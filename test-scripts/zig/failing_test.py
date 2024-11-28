@@ -2,7 +2,7 @@ import os
 import pytest
 from pathlib import Path
 
-from helper import parse_yadl, run_test, to_dir
+from helper import parse_yadl, run_failing_test, to_dir
 
 configurations = []
 TEST_DIR = os.path.abspath("test/failing")
@@ -13,9 +13,8 @@ file_names = map(lambda t: to_dir(t[0], t[1]), configurations)
 
 
 @pytest.mark.parametrize("config", configurations, ids=file_names)
-@pytest.mark.xfail(strict=True)
 def test_config(config):
-    run_test(config[0])
+    run_failing_test(config[0])
 
 
 def pytest_collection_modifyitems(items):
