@@ -34,8 +34,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    const exe_script_tests = b.addTest(.{
+        .root_source_file = b.path("src/yadlSourceTesting.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
-    const test_step = b.step("test", "Run unit tests");
+    const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
+    const run_exe_script_tests = b.addRunArtifact(exe_script_tests);
+
+    const test_step = b.step("test", "Run unit and script tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+    test_step.dependOn(&run_exe_script_tests.step);
 }

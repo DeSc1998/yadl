@@ -386,7 +386,6 @@ pub fn reduce(args: libtype.CallMatch, scope: *Scope) Error!void {
                 call_args[1] = e;
                 try exec_runtime_function(func, call_args, scope);
                 if (scope.result()) |r| {
-                    std.debug.print("INFO: reduce result type: {s}\n", .{@tagName(r)});
                     acc = r;
                 } else {
                     return Error.ValueNotFound;
